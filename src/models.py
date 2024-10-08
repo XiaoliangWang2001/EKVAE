@@ -18,27 +18,36 @@ class EKVAE(nn.Module):
         # create a normal dist with length B, T
         a_dist = D.normal.Normal(a_mean, a_cov).to_event(1)
         a = a_dist.rsample()
+        
+        q_a_x = a_dist.log_prob(a) # log q(a_t | x_t)
+        # entropy of q(a_t | x_t)
+        entropy_q_a_x = -a_dist.entropy()
 
         z_1_mean, z_1_covariance = self.initial_state_network(B) # Samples z_1 from a standard normal distribution
         self.kalman_filter(a, z_1_mean, z_1_covariance)
+        self.kalman_smoother(a, z_1_mean, z_1_covariance)
 
     def kalman_filter(self, a, z_1_mean, z_1_covariance):
         B, T, D = a.shape
         z_t_mean = z_1_mean
         z_t_covariance = z_1_covariance
         for t in range(T):
-            z_t_mean, z_t_covariance = self.kalman_step(a[:, t, :], z_t_mean, z_t_covariance)
+            z_t_mean, z_t_covariance = self.kalman_forward_step(a[:, t, :], z_t_mean, z_t_covariance)
         return z_t_mean, z_t_covariance
 
-    def kalman_step(self, x_t, z_t_mean, z_t_covariance):
+    def kalman_forward_step(self, a_t, z_t_mean, z_t_covariance):
+        # can one leverage JIT to speed up the kalman filter?
+        A = a_t.shape[-1]
+        D = z_t_mean.shape[-1]
         # Prediction step
-        z_t_pred_mean, z_t_pred_covariance = self.continuous_transition(z_t_mean, z_t_covariance)
+        mean_transition, covariance_transition = self.continuous_transition(z_t_mean, z_t_covariance)
+        z_t_pred_mean = mean_transition @ z_t_mean
+        z_t_pred_covariance = mean_transition @ z_t_covariance @ mean_transition.T + covariance_transition
         
         # Update step
-        K = z_t_pred_covariance @ self.auxiliary_inference_network.H.T @ torch.inverse(
-            self.auxiliary_inference_network.H @ z_t_pred_covariance @ self.auxiliary_inference_network.H.T + self.auxiliary_inference_network.R
-        )
-        z_t_mean = z_t_pred_mean + K @ (x_t - self.auxiliary_inference_network.H @ z_t_pred_mean)
-        z_t_covariance = (torch.eye(z_t_pred_covariance.shape[0], device=z_t_pred_covariance.device) - K @ self.auxiliary_inference_network.H) @ z_t_pred_covariance
-        
+        mean_update = self.auxiliary_inference_network.H @ z_t_pred_mean
+        S = z_t_pred_covariance[:, :A, :A] + self.auxiliary_observation_network.R
+        K = z_t_pred_covariance[:, :A] @ torch.inverse(S)
+        z_t_mean = z_t_pred_mean + K @ (a_t - mean_update)
+        z_t_covariance = z_t_pred_covariance - K @ S @ K.T
         return z_t_mean, z_t_covariance
