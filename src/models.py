@@ -1,0 +1,44 @@
+import torch
+import torch.nn as nn
+from subnetworks import InitialStateNetwork, ContinuousTransition, AuxiliaryInferenceNetwork, AuxiliaryObservationNetwork
+
+class EKVAE(nn.Module):
+    '''
+    The EKVAE model without constrained optimization framework.
+    '''
+    def __init__(self, continuous_dim, auxiliary_dim, hidden_dim, num_samples, num_base_matrices):
+        super(EKVAE, self).__init__()
+        self.initial_state_network = InitialStateNetwork(continuous_dim, hidden_dim)
+        self.continuous_transition = ContinuousTransition(continuous_dim, num_base_matrices, hidden_dim)
+        self.auxiliary_inference_network = AuxiliaryInferenceNetwork(continuous_dim, hidden_dim)
+        self.auxiliary_observation_network = AuxiliaryObservationNetwork(continuous_dim, auxiliary_dim, hidden_dim)
+    def forward(self, x):
+        B, T, D = x.shape
+        a_mean, a_cov = self.auxiliary_inference_network(x)
+        # create a normal dist with length B, T
+        a_dist = D.normal.Normal(a_mean, a_cov).to_event(1)
+        a = a_dist.rsample()
+
+        z_1_mean, z_1_covariance = self.initial_state_network(B) # Samples z_1 from a standard normal distribution
+        self.kalman_filter(a, z_1_mean, z_1_covariance)
+
+    def kalman_filter(self, a, z_1_mean, z_1_covariance):
+        B, T, D = a.shape
+        z_t_mean = z_1_mean
+        z_t_covariance = z_1_covariance
+        for t in range(T):
+            z_t_mean, z_t_covariance = self.kalman_step(a[:, t, :], z_t_mean, z_t_covariance)
+        return z_t_mean, z_t_covariance
+
+    def kalman_step(self, x_t, z_t_mean, z_t_covariance):
+        # Prediction step
+        z_t_pred_mean, z_t_pred_covariance = self.continuous_transition(z_t_mean, z_t_covariance)
+        
+        # Update step
+        K = z_t_pred_covariance @ self.auxiliary_inference_network.H.T @ torch.inverse(
+            self.auxiliary_inference_network.H @ z_t_pred_covariance @ self.auxiliary_inference_network.H.T + self.auxiliary_inference_network.R
+        )
+        z_t_mean = z_t_pred_mean + K @ (x_t - self.auxiliary_inference_network.H @ z_t_pred_mean)
+        z_t_covariance = (torch.eye(z_t_pred_covariance.shape[0], device=z_t_pred_covariance.device) - K @ self.auxiliary_inference_network.H) @ z_t_pred_covariance
+        
+        return z_t_mean, z_t_covariance
