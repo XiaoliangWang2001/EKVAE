@@ -58,7 +58,7 @@ class ContinuousTransition(nn.Module):
         super(ContinuousTransition, self).__init__()
         self.mixture_network = mixture_network
         self.base_matrices_z = nn.Parameter(torch.randn(num_base_matrices, continuous_dim, continuous_dim))
-        self.base_matrices_q = nn.Parameter(torch.diag_embed(torch.randn(num_base_matrices, continuous_dim)))
+        self.base_matrices_q = nn.Parameter(torch.randn(num_base_matrices, continuous_dim))
         
     def forward(self, z_t_1):
         
@@ -66,7 +66,7 @@ class ContinuousTransition(nn.Module):
         mixture_weights = self.mixture_network(z_t_1) # B, T, num_base_matrices
         mean_transition = torch.einsum('btd, dmm -> btmm', mixture_weights, self.base_matrices_z)
         mixed_matrix_q = torch.einsum('btd, dmm -> btmm', mixture_weights, self.base_matrices_q)
-        covariance_transition = F.softplus(mixed_matrix_q) + SCALE_OFFSET
+        covariance_transition = torch.diag_embed(F.softplus(mixed_matrix_q)) + SCALE_OFFSET
 
         return mean_transition, covariance_transition
 
@@ -82,9 +82,9 @@ class AuxiliaryObservationNetwork(nn.Module):
 
     def forward(self, z_t):
         mean = z_t @ self.H # B, T, D @ D, A -> B, T, A
-        covariance = torch.diag_embed(self.R) # A, A
+         # A, A
         # Add axis to covariance for broadcasting
-        covariance = covariance[None, None, ...] # 1, 1, A, A
+        covariance = self.R[None, None, ...] # 1, 1, A, A
         return mean, covariance
 
 class AuxiliaryInferenceNetwork(nn.Module):
