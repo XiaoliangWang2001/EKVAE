@@ -1,0 +1,3 @@
+[submodule "torch-kalman"]
+	path = torch-kalman
+	url = https://github.com/XiaoliangWang2001/torch-kalman
