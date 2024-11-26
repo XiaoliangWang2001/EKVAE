@@ -16,15 +16,15 @@ class EKVAE(nn.Module):
     """
 
     def __init__(
-        self, continuous_dim, auxiliary_dim, hidden_dim, num_samples, num_base_matrices
+        self, continuous_dim, control_dim, auxiliary_dim, hidden_dim, num_samples, num_base_matrices
     ):
         super(EKVAE, self).__init__()
         self.initial_state_network = InitialStateNetwork(continuous_dim, hidden_dim)
         self.continuous_transition = ContinuousTransition(
-            continuous_dim, num_base_matrices, hidden_dim
+            continuous_dim, control_dim, num_base_matrices, hidden_dim
         )
         self.auxiliary_inference_network = AuxiliaryInferenceNetwork(
-            continuous_dim, hidden_dim
+            continuous_dim, auxiliary_dim, hidden_dim
         )
         self.auxiliary_observation_network = AuxiliaryObservationNetwork(
             continuous_dim, auxiliary_dim, hidden_dim
