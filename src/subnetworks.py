@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
 
+from torch_kalman.standard import KalmanFilter
+
 SCALE_OFFSET = 1e-6
 
 
@@ -32,7 +34,7 @@ class VHPInferenceNetwork(nn.Module):
 
 class InitialStateNetwork(nn.Module):
     """
-    The generative model for the initial state z_1. Takes in zeta samples from a Gaussian distribution, then transforms it with a neural network.
+    The generative model for the initial state z_1. Samples zeta from a Gaussian distribution, then transforms it with a neural network.
     """
 
     def __init__(self, continuous_dim, hidden_dim):
@@ -46,7 +48,9 @@ class InitialStateNetwork(nn.Module):
         self.fc3 = nn.Linear(hidden_dim, 2 * continuous_dim)
         self.continuous_dim = continuous_dim
 
-    def forward(self, zeta):
+    def forward(self):
+        # Sample from the prior
+        zeta = torch.randn(self.batch_size, 1)
         # Apply layers with activations
         x = F.relu(self.fc1(zeta))
         x = F.relu(self.fc2(x))
@@ -72,7 +76,7 @@ class ContinuousTransition(nn.Module):
             torch.randn(num_base_matrices, continuous_dim, continuous_dim)
         )
         self.base_matrices_B = nn.Parameter(
-            torch.randn(num_base_matrices, control_dim, continuous_dim)
+            torch.randn(num_base_matrices, continuous_dim, control_dim)
         )
 
         self.base_matrices_q = nn.Parameter(
@@ -81,19 +85,17 @@ class ContinuousTransition(nn.Module):
 
     def forward(self, z_t, u_t):
         # Compute the mixture weights
-        mixture_weights = self.mixture_network(z_t, u_t)  # B, T, num_base_matrices
+        mixture_weights = self.mixture_network(z_t, u_t)  # B, num_base_matrices
         z_weights = torch.einsum(
-            "btn, nmm -> btmm", mixture_weights, self.base_matrices_F
+            "bn, nij -> bij", mixture_weights, self.base_matrices_F
         )
         u_weights = torch.einsum(
-            "btn, nmm -> btmm", mixture_weights, self.base_matrices_B
+            "bn, nij -> bij", mixture_weights, self.base_matrices_B
         )
         mixed_matrix_q = torch.einsum(
-            "btn, nm -> btm", mixture_weights, self.base_matrices_q
+            "bn, nm -> bm", mixture_weights, self.base_matrices_q
         )
-        covariance = (
-            torch.diag_embed(F.softplus(mixed_matrix_q)) + SCALE_OFFSET
-        )
+        covariance = torch.diag_embed(F.softplus(mixed_matrix_q)) + SCALE_OFFSET
 
         return z_weights, u_weights, covariance
 
@@ -167,3 +169,244 @@ class ObservationNetwork(nn.Module):
         )
 
         return dist
+
+
+class KFContinuousTransition(KalmanFilter):
+    def __init__(
+        self,
+        continuous_dim: int,
+        control_dim: int,
+        num_base_matrices: int,
+        mixture_network: nn.Module,
+        compile_mode: bool = False,
+    ):
+        super().__init__(compile_mode=False)
+        self.continuous_transition = ContinuousTransition(
+            continuous_dim=continuous_dim,
+            control_dim=control_dim,
+            num_base_matrices=num_base_matrices,
+            mixture_network=mixture_network,
+        )
+        if compile_mode:
+            self.compiled_filter = torch.compile(self.filter)
+            self.compiled_smooth = torch.compile(self.smooth)
+
+    def _filter(
+        self,
+        observations,
+        controls,
+        observation_matrices,
+        observation_covariance,
+        observation_offsets,
+        initial_state_mean,
+        initial_state_covariance,
+    ):
+        """Modified filter method to handle dynamic transition parameters."""
+        batch_size, n_timesteps, n_dim_obs = observations.shape
+        n_dim_state = initial_state_mean.shape[-1]
+
+        # Initialize storage tensors
+        filtered_means = torch.zeros(
+            batch_size, n_timesteps, n_dim_state, device=observations.device
+        )
+        filtered_covs = torch.zeros(
+            batch_size,
+            n_timesteps,
+            n_dim_state,
+            n_dim_state,
+            device=observations.device,
+        )
+        predicted_means = torch.zeros_like(filtered_means)
+        predicted_covs = torch.zeros_like(filtered_covs)
+
+        # Initialize first timestep with initial state
+        time_indices = torch.arange(n_timesteps, device=observations.device)
+        predicted_means = torch.where(
+            (time_indices == 0).view(1, -1, 1),
+            initial_state_mean.unsqueeze(1),
+            predicted_means,
+        )
+        predicted_covs = torch.where(
+            (time_indices == 0).view(1, -1, 1, 1),
+            initial_state_covariance.unsqueeze(1),
+            predicted_covs,
+        )
+
+        # Store transition parameters for potential smoothing
+        transition_matrices = []
+        transition_covariances = []
+
+        for t in range(n_timesteps):
+            # 1. Correct step (update with observation)
+            _, filtered_means_t, filtered_covs_t = self._filter_correct(
+                observation_matrices[:, t],
+                observation_covariance[:, t],
+                observation_offsets[:, t],
+                predicted_means[:, t],
+                predicted_covs[:, t],
+                observations[:, t],
+            )
+
+            # Store filtered state
+            filtered_means = torch.where(
+                (time_indices == t).view(1, -1, 1),
+                filtered_means_t.unsqueeze(1),
+                filtered_means,
+            )
+            filtered_covs = torch.where(
+                (time_indices == t).view(1, -1, 1, 1),
+                filtered_covs_t.unsqueeze(1),
+                filtered_covs,
+            )
+
+            # 2. Sample from filtered distribution (if needed)
+            # Note: During inference, you might want to use the mean instead of sampling
+            if self.training:
+                dist = torch.distributions.MultivariateNormal(
+                    filtered_means_t, filtered_covs_t
+                )
+                z_t = dist.rsample()
+            else:
+                z_t = filtered_means_t
+
+            # 3. Predict next state (if not last timestep)
+            if t < n_timesteps - 1:
+                # Calculate transition parameters using current state
+                F_t, B_t, Q_t = self.continuous_transition(z_t, controls[:, t])
+                
+                # Store transition parameters for smoothing
+                transition_matrices.append(F_t)
+                transition_covariances.append(Q_t)
+
+                # Prepare control input with correct shape
+                control_t = controls[:, t].unsqueeze(-1)  # Add dimension for matrix multiplication
+
+                # Predict next state
+                pred_mean, pred_cov = self._filter_predict(
+                    F_t,  # transition matrix
+                    Q_t,  # transition covariance
+                    torch.zeros_like(filtered_means_t),  # transition offset
+                    filtered_means_t,
+                    filtered_covs_t,
+                    control_t,  # now has correct shape
+                    B_t,  # control matrix
+                )
+
+                # Store predicted state
+                predicted_means = torch.where(
+                    (time_indices == t + 1).view(1, -1, 1),
+                    pred_mean.unsqueeze(1),
+                    predicted_means,
+                )
+                predicted_covs = torch.where(
+                    (time_indices == t + 1).view(1, -1, 1, 1),
+                    pred_cov.unsqueeze(1),
+                    predicted_covs,
+                )
+
+        # Stack transition parameters
+        transition_matrices = torch.stack(transition_matrices, dim=1)
+        transition_covariances = torch.stack(transition_covariances, dim=1)
+
+        return (
+            filtered_means,
+            filtered_covs,
+            predicted_means,
+            predicted_covs,
+            transition_matrices,
+            transition_covariances,
+        )
+
+    def filter(
+        self,
+        observations,
+        controls,
+        observation_matrices,
+        observation_covariance,
+        observation_offsets,
+        initial_state_mean,
+        initial_state_covariance,
+    ):
+        return self._filter(
+            observations,
+            controls,
+            observation_matrices,
+            observation_covariance,
+            observation_offsets,
+            initial_state_mean,
+            initial_state_covariance,
+        )
+
+    def forward(
+        self,
+        observations,
+        controls,
+        observation_matrices,
+        observation_covariance,
+        observation_offsets,
+        initial_state_mean,
+        initial_state_covariance,
+        mode="filter",
+    ):
+        if self.compile_mode:
+            (
+                filtered_means,
+                filtered_covs,
+                predicted_means,
+                predicted_covs,
+                transition_matrices,
+                transition_covariances,
+            ) = self.compiled_filter(
+                observations,
+                controls,
+                observation_matrices,
+                observation_covariance,
+                observation_offsets,
+                initial_state_mean,
+                initial_state_covariance,
+                mode,
+            )
+            if mode == "filter":
+                return filtered_means, filtered_covs
+            elif mode == "smooth":
+                return self.compiled_smooth(
+                    filtered_means,
+                    filtered_covs,
+                    predicted_means,
+                    predicted_covs,
+                    transition_matrices,
+                )
+            else:
+                raise ValueError(f"Invalid mode: {mode}")
+        else:
+            # Run filter
+            (
+                filtered_means,
+                filtered_covs,
+                predicted_means,
+                predicted_covs,
+                transition_matrices,
+                transition_covariances,
+            ) = self.filter(
+                observations=observations,
+                controls=controls,
+                observation_matrices=observation_matrices,
+                observation_covariance=observation_covariance,
+                observation_offsets=observation_offsets,
+                initial_state_mean=initial_state_mean,
+                initial_state_covariance=initial_state_covariance,
+            )
+            if mode == "filter":
+                return filtered_means, filtered_covs
+            elif mode == "smooth":
+                # Run smoother with stored transition parameters
+                smoothed_means, smoothed_covs = self._smooth(
+                    filtered_means,
+                    filtered_covs,
+                    predicted_means,
+                    predicted_covs,
+                    transition_matrices,
+                )
+                return smoothed_means, smoothed_covs
+            else:
+                raise ValueError(f"Invalid mode: {mode}")
