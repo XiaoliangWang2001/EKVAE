@@ -29,7 +29,8 @@ class VHPInferenceNetwork(nn.Module):
 
         mean = output[..., :1]
         covariance = F.softplus(output[..., 1:]) + SCALE_OFFSET
-        return mean, covariance
+        dist = D.independent.Independent(D.normal.Normal(mean, covariance), 1)
+        return dist
 
 
 class InitialStateNetwork(nn.Module):
@@ -48,16 +49,14 @@ class InitialStateNetwork(nn.Module):
         self.fc3 = nn.Linear(hidden_dim, 2 * continuous_dim)
         self.continuous_dim = continuous_dim
 
-    def forward(self):
-        # Sample from the prior
-        zeta = torch.randn(self.batch_size, 1)
+    def forward(self, zeta):
         # Apply layers with activations
         x = F.relu(self.fc1(zeta))
         x = F.relu(self.fc2(x))
         z_1 = self.fc3(x)
 
-        mean = z_1[..., : self.continuous_dim]
-        covariance = F.softplus(z_1[..., self.continuous_dim :]) + SCALE_OFFSET
+        mean = z_1[..., : self.continuous_dim]  # B, D
+        covariance = torch.diag_embed(F.softplus(z_1[..., self.continuous_dim :])) + SCALE_OFFSET  # B, D, D
         return mean, covariance
 
 
@@ -85,7 +84,7 @@ class ContinuousTransition(nn.Module):
 
     def forward(self, z_t, u_t):
         # Compute the mixture weights
-        mixture_weights = self.mixture_network(z_t, u_t)  # B, num_base_matrices
+        mixture_weights = self.mixture_network(torch.cat((z_t, u_t), dim=-1))  # B, num_base_matrices
         z_weights = torch.einsum(
             "bn, nij -> bij", mixture_weights, self.base_matrices_F
         )
@@ -135,7 +134,8 @@ class AuxiliaryInferenceNetwork(nn.Module):
         mean = output[..., : self.auxiliary_dim]
         covariance = F.softplus(output[..., self.auxiliary_dim :]) + SCALE_OFFSET
         assert covariance.shape[-1] == self.auxiliary_dim
-        return mean, covariance
+        a_dist = D.independent.Independent(D.normal.Normal(mean, covariance), 1)
+        return a_dist
 
     def _build_network(self, obs_dim, auxiliary_dim, hidden_dim):
         return nn.Sequential(
@@ -234,6 +234,7 @@ class KFContinuousTransition(KalmanFilter):
 
         # Store transition parameters for potential smoothing
         transition_matrices = []
+        control_matrices = []
         transition_covariances = []
 
         for t in range(n_timesteps):
@@ -277,7 +278,7 @@ class KFContinuousTransition(KalmanFilter):
                 # Store transition parameters for smoothing
                 transition_matrices.append(F_t)
                 transition_covariances.append(Q_t)
-
+                control_matrices.append(B_t)
                 # Prepare control input with correct shape
                 control_t = controls[:, t].unsqueeze(-1)  # Add dimension for matrix multiplication
 
@@ -315,6 +316,7 @@ class KFContinuousTransition(KalmanFilter):
             predicted_covs,
             transition_matrices,
             transition_covariances,
+            control_matrices,
         )
 
     def filter(
@@ -356,6 +358,7 @@ class KFContinuousTransition(KalmanFilter):
                 predicted_covs,
                 transition_matrices,
                 transition_covariances,
+                control_matrices,
             ) = self.compiled_filter(
                 observations,
                 controls,
@@ -367,15 +370,16 @@ class KFContinuousTransition(KalmanFilter):
                 mode,
             )
             if mode == "filter":
-                return filtered_means, filtered_covs
+                return filtered_means, filtered_covs, transition_matrices, transition_covariances, control_matrices
             elif mode == "smooth":
-                return self.compiled_smooth(
+                smoothed_means, smoothed_covs = self.compiled_smooth(
                     filtered_means,
                     filtered_covs,
                     predicted_means,
                     predicted_covs,
                     transition_matrices,
                 )
+                return filtered_means, filtered_covs, transition_matrices, transition_covariances, smoothed_means, smoothed_covs, control_matrices
             else:
                 raise ValueError(f"Invalid mode: {mode}")
         else:
@@ -387,6 +391,7 @@ class KFContinuousTransition(KalmanFilter):
                 predicted_covs,
                 transition_matrices,
                 transition_covariances,
+                control_matrices,
             ) = self.filter(
                 observations=observations,
                 controls=controls,
@@ -397,7 +402,7 @@ class KFContinuousTransition(KalmanFilter):
                 initial_state_covariance=initial_state_covariance,
             )
             if mode == "filter":
-                return filtered_means, filtered_covs
+                return filtered_means, filtered_covs, transition_matrices, transition_covariances, control_matrices
             elif mode == "smooth":
                 # Run smoother with stored transition parameters
                 smoothed_means, smoothed_covs = self._smooth(
@@ -407,6 +412,6 @@ class KFContinuousTransition(KalmanFilter):
                     predicted_covs,
                     transition_matrices,
                 )
-                return smoothed_means, smoothed_covs
+                return filtered_means, filtered_covs, transition_matrices, transition_covariances, smoothed_means, smoothed_covs, control_matrices
             else:
                 raise ValueError(f"Invalid mode: {mode}")
