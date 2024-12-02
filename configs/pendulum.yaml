@@ -1,0 +1,24 @@
+# Model dimensions
+continuous_dim: 5 # dim for continuous state z
+control_dim: 3 # dim for control u
+auxiliary_dim: 3 # dim for auxiliary variable a
+num_samples: 1 # number of samples for monte carlo estimate
+strategy: "importance"
+
+# Network configuration
+initial_state:
+  hidden_dim: 64
+
+auxiliary:
+  hidden_dim: 64
+
+network:
+  hidden_dim: 128
+  num_layers: 3
+  dropout: 0.1
+
+# Kalman filter settings
+kalman:
+  num_base_matrices: 4
+  compile_mode: true
+  mixture_net_dim: 64
